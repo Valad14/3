@@ -3,6 +3,7 @@ import io
 import re
 import unicodedata
 import zipfile
+from collections import Counter
 from datetime import datetime
 from difflib import SequenceMatcher
 
@@ -15,6 +16,24 @@ from lxml.builder import ElementMaker
 # -----------------------------------------------------------------------------
 # 1. Общие настройки
 # -----------------------------------------------------------------------------
+
+VARIANT_TYPES = [
+    "Идентично",
+    "Графическое",
+    "Фонетическое",
+    "Морфологическое",
+    "Лексическое",
+    "Пропуск",
+]
+
+TYPE_EXPLANATIONS = {
+    "Идентично": "форма, лемма и грамматическая разметка совпадают",
+    "Графическое": "та же лексема/форма, но другое написание, титло, надстрочный знак или историческая буква",
+    "Фонетическое": "различие похоже на фонетическую замену при той же лексеме или близкой форме",
+    "Морфологическое": "лемма совпадает, но грамматические признаки XML отличаются",
+    "Лексическое": "разные леммы/слова, которые не сводятся к графике или фонетике",
+    "Пропуск": "для слова эталона не найдено соответствие в другом списке",
+}
 
 TABLE_FONT_STACK = (
     '"Noto Sans", "Noto Serif", "Noto Sans Symbols 2", "Segoe UI Historic", '
@@ -141,7 +160,7 @@ PHONETIC_REPLACEMENTS = {
     "Ꙋ": "у",
 }
 
-WORD_COLUMN_PREFIXES = ("Основной список (", "Слово (")
+WORD_COLUMN_PREFIXES = ("ЭТАЛОН (", "Слово (")
 
 
 # -----------------------------------------------------------------------------
@@ -391,8 +410,59 @@ def align_pair(base_list: list[dict], target_list: list[dict]) -> dict[int, dict
 
 
 # -----------------------------------------------------------------------------
-# 4. Контекст
+# 4. Классификация разночтений
 # -----------------------------------------------------------------------------
+
+def classify_variant(main_word: dict | None, witness_word: dict | None) -> tuple[str, str]:
+    if not main_word or not witness_word:
+        return "Пропуск", "нет соответствующего слова в выбранном списке"
+
+    if main_word["surface"] == witness_word["surface"]:
+        if same_morph(main_word, witness_word) and (
+            not main_word.get("lemma_norm")
+            or not witness_word.get("lemma_norm")
+            or same_lemma(main_word, witness_word)
+        ):
+            return "Идентично", "совпадают исходная форма, лемма и грамматическая разметка"
+        return (
+            "Морфологическое",
+            "форма совпадает, но лемма или XML-грамматика отличаются",
+        )
+
+    if same_lemma(main_word, witness_word) and both_have_morph(main_word, witness_word) and not same_morph(main_word, witness_word):
+        return (
+            "Морфологическое",
+            f"лемма совпадает ({main_word['lemma']}), но грамматика различается: "
+            f"{format_morph(main_word['morph'])} ↔ {format_morph(witness_word['morph'])}",
+        )
+
+    if same_lemma(main_word, witness_word):
+        if main_word["orth"] == witness_word["orth"]:
+            return "Графическое", "после снятия титл/надстрочных знаков формы совпадают"
+        if (
+            main_word["phonetic"] == witness_word["phonetic"]
+            and min(len(main_word["orth"]), len(witness_word["orth"])) >= 3
+        ):
+            return "Фонетическое", "лемма совпадает; совпала фонетическая нормализация"
+        return "Графическое", "лемма и разметка совместимы; различается написание"
+
+    if main_word["orth"] and main_word["orth"] == witness_word["orth"]:
+        return "Графическое", "формы совпали после орфографической нормализации"
+
+    sim = edit_similarity(main_word["orth"], witness_word["orth"])
+    if (
+        main_word["phonetic"]
+        and main_word["phonetic"] == witness_word["phonetic"]
+        and min(len(main_word["orth"]), len(witness_word["orth"])) >= 3
+        and sim >= 0.55
+    ):
+        return "Фонетическое", "совпала фонетическая нормализация при близких формах"
+
+    if sim >= 0.82:
+        return "Графическое", f"формы очень близки графически, сходство {sim:.2f}"
+
+    return "Лексическое", "леммы и нормализованные формы различаются"
+
 
 def get_context(words: list[dict], index: int, context_size: int = 10) -> tuple[list[dict], list[dict]]:
     start = max(0, index - context_size)
@@ -409,6 +479,7 @@ def export_aligned_xml(
     aligned_words: list[dict | None],
     base_filename: str,
     target_filename: str,
+    variant_types: dict[int, str],
 ) -> str:
     E = ElementMaker(
         namespace="http://www.tei-c.org/ns/1.0",
@@ -456,13 +527,14 @@ def export_aligned_xml(
                 xml_id=aligned_word["id"],
                 lemma=aligned_word["lemma"],
                 type="target",
+                variant=variant_types.get(i, "unknown"),
             )
             for morph_name, morph_values in aligned_word["morph"].items():
                 for morph_value in morph_values:
                     target_elem.append(E.fs(E.f(E.symbol(value=morph_value), name=morph_name)))
             ab.append(target_elem)
         else:
-            ab.append(E.w("---", type="missing"))
+            ab.append(E.w("---", type="missing", variant="Пропуск"))
         ab.append(E.pc(" "))
 
     tei.find('.//{http://www.tei-c.org/ns/1.0}div').append(ab)
@@ -480,15 +552,19 @@ def export_all_aligned(data: dict, edited_df: pd.DataFrame) -> io.BytesIO:
         for o_name in data["others_list"]:
             base_words = data["base_words"]
             aligned_words = []
+            variant_types = {}
+            type_col = f"Тип ({o_name})"
             for i, _ in enumerate(base_words):
                 matched_word = data["all_aligns"][o_name].get(i)
                 aligned_words.append(matched_word)
+                variant_types[i] = str(edited_df.iloc[i][type_col])
 
             xml_content = export_aligned_xml(
                 base_words,
                 aligned_words,
                 data["main_file"],
                 o_name,
+                variant_types,
             )
             filename = (
                 f"aligned_{data['main_file'].replace('.xml', '')}"
@@ -530,6 +606,22 @@ def apply_display_mode(df: pd.DataFrame, mode: str) -> pd.DataFrame:
             result[col] = result[col].map(lambda value: display_text(value, mode))
     return result
 
+
+def get_type_columns(df: pd.DataFrame) -> list[str]:
+    return [col for col in df.columns if col.startswith("Тип (")]
+
+
+def get_reason_columns(df: pd.DataFrame) -> list[str]:
+    return [col for col in df.columns if col.startswith("Причина (")]
+
+
+def build_filter_mask(df: pd.DataFrame, selected_types: list[str], scope: str, selected_type_col: str | None) -> pd.Series:
+    type_cols = get_type_columns(df)
+    if not selected_types:
+        return pd.Series(False, index=df.index)
+    if scope == "В выбранном списке" and selected_type_col:
+        return df[selected_type_col].isin(selected_types)
+    return df[type_cols].isin(selected_types).any(axis=1)
 
 
 def render_context(words: list[dict], word_index: int, selected_surface: str, source_name: str, display_mode: str) -> None:
@@ -597,20 +689,25 @@ st.markdown(
     """
     # Сравнительный анализ параллельных корпусов
 
-    Загрузите XML-TEI файлы, выберите основной список и получите таблицу
-    выравнивания с контекстом, статистикой совпадений и экспортом.
+    Загрузите XML-TEI файлы, выберите эталонный список и получите таблицу
+    выравнивания с проверкой типов разночтений, фильтром, контекстом, статистикой
+    и экспортом.
     """
 )
 
 with st.expander("Подробная инструкция пользователя", expanded=False):
     st.markdown(
         """
-        ### Как читать таблицу
+        ### Алгоритм определения типов
 
-        Программа больше не проставляет автоматические типы вроде
-        «морфологическое», «графическое», «фонетическое» и т. д. Таблица показывает
-        только выравнивание: слово из основного списка и найденные соответствия в
-        остальных XML-файлах.
+        | Тип | Что означает |
+        |---|---|
+        | **Идентично** | исходная форма, лемма и грамматическая XML-разметка совпадают |
+        | **Графическое** | различаются титла, надстрочные знаки, исторические буквы или написание при той же лемме |
+        | **Фонетическое** | после фонетической нормализации формы совпадают, но это не чистая графика |
+        | **Морфологическое** | лемма совпадает, но различаются `case`, `gender`, `number`, `tense`, `person` и другие признаки |
+        | **Лексическое** | разные леммы/слова |
+        | **Пропуск** | в другом списке нет соответствующего слова |
 
         ### Старый компьютер и «квадратики» вместо символов
 
@@ -639,7 +736,7 @@ with st.sidebar:
 
     file_names = list(st.session_state.raw_data.keys())
     if file_names:
-        main_file = st.selectbox("Выберите основной список", file_names)
+        main_file = st.selectbox("Выберите эталонный список", file_names)
         st.success(f"Загружено файлов: {len(file_names)}")
         word_counts = {name: len(words) for name, words in st.session_state.raw_data.items()}
         with st.expander("Сколько слов прочитано"):
@@ -678,7 +775,7 @@ if st.session_state.raw_data and len(st.session_state.raw_data) >= 2:
         base_words = st.session_state.raw_data[main_file]
         others = [name for name in st.session_state.raw_data.keys() if name != main_file]
 
-        with st.spinner("Синхронизация текстов..."):
+        with st.spinner("Синхронизация текстов и классификация типов..."):
             all_aligns = {
                 name: align_pair(base_words, st.session_state.raw_data[name])
                 for name in others
@@ -690,11 +787,15 @@ if st.session_state.raw_data and len(st.session_state.raw_data) >= 2:
                     "№": i + 1,
                     "ID": base_word["id"],
                     "Лемма": base_word["lemma"],
-                    f"Основной список ({main_file})": base_word["surface"],
+                    "Разметка эталона": format_morph(base_word["morph"]),
+                    f"ЭТАЛОН ({main_file})": base_word["surface"],
                 }
                 for other_name in others:
                     matched_word = all_aligns[other_name].get(i)
+                    variant_type, reason = classify_variant(base_word, matched_word)
                     row[f"Слово ({other_name})"] = matched_word["surface"] if matched_word else "---"
+                    row[f"Тип ({other_name})"] = variant_type
+                    row[f"Причина ({other_name})"] = reason
                 rows.append(row)
 
             st.session_state.comp_df = pd.DataFrame(rows)
@@ -710,8 +811,10 @@ elif st.session_state.raw_data:
 if "comp_df" in st.session_state:
     df = st.session_state.comp_df.copy()
     main_file = st.session_state.main_file
+    type_cols = get_type_columns(df)
+    reason_cols = get_reason_columns(df)
 
-    st.subheader("Таблица выравнивания")
+    st.subheader("Таблица-редактор")
 
     if display_mode == "Совместимый режим":
         st.markdown(
@@ -719,14 +822,61 @@ if "comp_df" in st.session_state:
             unsafe_allow_html=True,
         )
 
+    filter_col1, filter_col2, filter_col3 = st.columns([2, 2, 3])
+    with filter_col1:
+        selected_types = st.multiselect(
+            "Фильтр по типам",
+            options=VARIANT_TYPES,
+            default=VARIANT_TYPES,
+        )
+    with filter_col2:
+        filter_scope = st.radio(
+            "Искать тип",
+            options=["В любом списке", "В выбранном списке"],
+            horizontal=True,
+        )
+    with filter_col3:
+        selected_other = None
+        selected_type_col = None
+        if filter_scope == "В выбранном списке":
+            selected_other = st.selectbox("Список для фильтра", st.session_state.others_list)
+            selected_type_col = f"Тип ({selected_other})"
+
+    filter_mask = build_filter_mask(df, selected_types, filter_scope, selected_type_col)
+    st.caption(f"Показано строк: {int(filter_mask.sum())} из {len(df)}")
+
+    show_reasons = st.checkbox("Показать пояснения к автоматическому типу", value=False)
     table_df = apply_display_mode(df, display_mode)
-    st.caption(f"Показано строк: {len(table_df)}")
-    st.dataframe(
-        table_df,
+    if not show_reasons:
+        table_df = table_df.drop(columns=reason_cols, errors="ignore")
+
+    type_column_config = {
+        col: st.column_config.SelectboxColumn(
+            col,
+            options=VARIANT_TYPES,
+            required=True,
+            help="Тип можно исправить вручную двойным кликом по ячейке.",
+        )
+        for col in type_cols
+    }
+    disabled_cols = [col for col in table_df.columns if col not in type_cols]
+
+    edited_visible = st.data_editor(
+        table_df.loc[filter_mask],
         use_container_width=True,
         height=520,
         hide_index=True,
+        disabled=disabled_cols,
+        column_config=type_column_config,
+        key="comparison_editor",
     )
+
+    # Возвращаем ручные правки из отфильтрованного вида в полную таблицу.
+    if not edited_visible.empty:
+        for col in type_cols:
+            if col in edited_visible.columns:
+                df.loc[edited_visible.index, col] = edited_visible[col]
+        st.session_state.comp_df = df
 
     st.divider()
     st.subheader("Контекст слова")
@@ -741,10 +891,10 @@ if "comp_df" in st.session_state:
         )
         selected_row_idx = int(selected_row_number) - 1
     with context_col2:
-        context_options = [f"Основной список ({main_file})"] + [f"Слово ({name})" for name in st.session_state.others_list]
+        context_options = [f"ЭТАЛОН ({main_file})"] + [f"Слово ({name})" for name in st.session_state.others_list]
         context_source = st.radio("Источник контекста:", context_options, horizontal=True)
 
-    if context_source.startswith("Основной список"):
+    if context_source.startswith("ЭТАЛОН"):
         words_list = st.session_state.base_words
         word_index = selected_row_idx
         selected_surface = st.session_state.base_words[selected_row_idx]["surface"]
@@ -761,20 +911,23 @@ if "comp_df" in st.session_state:
             st.info("В выбранном списке для этой строки стоит пропуск.")
 
     st.divider()
-    st.subheader("Статистика выравнивания")
+    st.subheader("Статистика по текстам")
     stats_cols = st.columns(min(3, max(1, len(st.session_state.others_list))))
-    total = len(df)
     for idx, other_name in enumerate(st.session_state.others_list):
         with stats_cols[idx % len(stats_cols)]:
-            word_col = f"Слово ({other_name})"
-            matched = int((df[word_col] != "---").sum()) if word_col in df.columns else 0
-            missing = total - matched
-            matched_percent = round(matched / total * 100, 1) if total else 0
+            type_col = f"Тип ({other_name})"
+            counts = Counter(df[type_col])
+            total = len(df)
+            identical = counts.get("Идентично", 0)
+            similarity = round(identical / total * 100, 1) if total else 0
             st.markdown(f"### {other_name}")
             st.metric("Всего строк", total)
-            st.metric("Найдено соответствий", f"{matched} ({matched_percent}%)")
-            st.metric("Пропуски", missing)
-            st.progress(matched_percent / 100 if total else 0, text=f"Выравнивание: {matched_percent}%")
+            st.metric("Идентично", f"{identical} ({similarity}%)")
+            st.progress(similarity / 100 if total else 0, text=f"Сходство: {similarity}%")
+            for type_name in VARIANT_TYPES:
+                count = counts.get(type_name, 0)
+                if count:
+                    st.write(f"- {type_name}: {count}")
 
     st.divider()
     st.subheader("Экспорт результатов")
