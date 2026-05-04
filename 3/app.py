@@ -40,9 +40,9 @@ TYPE_EXPLANATIONS = {
 }
 
 TABLE_FONT_STACK = (
-    '"Noto Sans", "Noto Serif", "Noto Sans Symbols 2", "Segoe UI Historic", '
-    '"Segoe UI Symbol", "Arial Unicode MS", "DejaVu Sans", "FreeSerif", '
-    '"Times New Roman", serif'
+    '"Noto Sans", "Noto Serif", "Segoe UI Historic", "Segoe UI Symbol", '
+    '"BukyVede", "Menaion Unicode", "Monomakh Unicode", "Fedorovsk Unicode", '
+    '"Arial Unicode MS", "DejaVu Sans", "FreeSerif", "Times New Roman", serif'
 )
 
 # Надстрочные кириллические буквы U+2DE0..U+2DFF и несколько редких знаков.
@@ -130,6 +130,42 @@ COMPATIBLE_REPLACEMENTS = {
     "ї": "и",
     "ѐ": "е",
     "ѝ": "и",
+}
+
+# Замены только для показа на экране. Они не меняют исходные данные,
+# CSV и XML-экспорт. Цель — убрать «квадраты» на компьютерах, где нет
+# шрифтов для старославянских/древнерусских знаков.
+DISPLAY_SAFE_REPLACEMENTS = {
+    "ѡ": "о", "Ѡ": "О",
+    "ѣ": "е", "Ѣ": "Е",
+    "ѥ": "е", "Ѥ": "Е",
+    "ѧ": "я", "Ѧ": "Я",
+    "ѩ": "я", "Ѩ": "Я",
+    "ѫ": "у", "Ѫ": "У",
+    "ѭ": "ю", "Ѭ": "Ю",
+    "ѳ": "ф", "Ѳ": "Ф",
+    "ѵ": "и", "Ѵ": "И",
+    "ѯ": "кс", "Ѯ": "КС",
+    "ѱ": "пс", "Ѱ": "ПС",
+    "ѿ": "от", "Ѿ": "ОТ",
+    "ꙁ": "з", "Ꙁ": "З",
+    "ꙑ": "ы", "Ꙑ": "Ы",
+    "ꙗ": "я", "Ꙗ": "Я",
+    "ꙋ": "у", "Ꙋ": "У",
+    "ҁ": "к",
+    "ı": "и",
+    "і": "и", "І": "И",
+    "ї": "и", "Ї": "И",
+    "ѐ": "е", "Ѐ": "Е",
+    "ѝ": "и", "Ѝ": "И",
+    "˜": "~",
+    "∽": "~",
+    "⩫": "~",
+    "⁘": ":",
+    "⸱": ".",
+    "·": ".",
+    "※": "*",
+    "■": "[квадрат]",
 }
 
 PHONETIC_REPLACEMENTS = {
@@ -682,43 +718,53 @@ def export_all_aligned(data: dict, edited_df: pd.DataFrame) -> io.BytesIO:
 
 
 # -----------------------------------------------------------------------------
-# 7. Отображение таблицы и совместимость символов
+# 7. Отображение таблицы и автоматическая совместимость символов
 # -----------------------------------------------------------------------------
 
-def compatible_text(text: str) -> str:
+def display_text(text: str) -> str:
+    """Готовит текст к показу на старых компьютерах без редких шрифтов.
+
+    Исходные формы сохраняются в st.session_state и используются при экспорте.
+    Меняется только видимое значение в таблице и контексте: надстрочные буквы
+    раскрываются в квадратных скобках, титла/ударения убираются, редкие буквы
+    заменяются близкими обычными кириллическими символами.
+    """
+    if text is None:
+        return ""
+    text = str(text)
     if not text or text == "---":
         return text
-    text = expand_combining_letters(str(text), bracketed=True)
+
+    text = unicodedata.normalize("NFC", text)
+    text = expand_combining_letters(text, bracketed=True)
     text = remove_combining_marks(text, expand_letters=False)
-    for old, new in COMPATIBLE_REPLACEMENTS.items():
+    for old, new in DISPLAY_SAFE_REPLACEMENTS.items():
         text = text.replace(old, new)
     return text
 
 
-def display_text(text: str, mode: str) -> str:
-    if not text or text == "---":
-        return text
-    if mode.startswith("Оригинал"):
-        return text
-    if mode.startswith("Без надстрочных"):
-        return remove_combining_marks(text, expand_letters=True)
-    return compatible_text(text)
+def should_auto_display_column(col: str) -> bool:
+    return (
+        col == "Лемма"
+        or col.startswith(WORD_COLUMN_PREFIXES)
+        or col.startswith("Причина (")
+    )
 
 
-def apply_display_mode(df: pd.DataFrame, mode: str) -> pd.DataFrame:
+def apply_display_mode(df: pd.DataFrame) -> pd.DataFrame:
     result = df.copy()
     for col in result.columns:
-        if col.startswith(WORD_COLUMN_PREFIXES):
-            result[col] = result[col].map(lambda value: display_text(value, mode))
+        if should_auto_display_column(col):
+            result[col] = result[col].map(display_text)
     return result
 
 
 
-def render_context(words: list[dict], word_index: int, selected_surface: str, source_name: str, display_mode: str) -> None:
+def render_context(words: list[dict], word_index: int, selected_surface: str, source_name: str) -> None:
     before, after = get_context(words, word_index)
-    before_text = " ".join(display_text(w["surface"], display_mode) for w in before)
-    after_text = " ".join(display_text(w["surface"], display_mode) for w in after)
-    selected = display_text(selected_surface, display_mode)
+    before_text = " ".join(display_text(w["surface"]) for w in before)
+    after_text = " ".join(display_text(w["surface"]) for w in after)
+    selected = display_text(selected_surface)
 
     context_html = "<div class='context-box'>"
     context_html += "<b>Контекст (10 слов до и после):</b><br><br>"
@@ -798,9 +844,10 @@ with st.expander("Подробная инструкция пользовател
 
         ### Символы в таблице
 
-        Ручной переключатель отображения убран. Приложение показывает исходный
-        текст автоматически и подключает расширенный набор шрифтов для
-        исторической кириллицы и надстрочных знаков.
+        Ручной переключатель отображения убран. Приложение автоматически готовит
+        текст к показу на старых компьютерах: редкие исторические символы и
+        надстрочные знаки заменяются только в видимой таблице. Исходный XML и
+        экспорт остаются без изменений.
         """
     )
 
@@ -847,7 +894,7 @@ with st.sidebar:
         st.rerun()
 
 # Исторические символы показываются автоматически, без ручного переключателя в интерфейсе.
-display_mode = "Оригинал"
+# Для таблицы и контекста используется безопасное отображение без «квадратов».
 
 if st.session_state.raw_data and len(st.session_state.raw_data) >= 2:
     if st.button("Запустить сравнение", type="primary"):
@@ -900,7 +947,7 @@ if "comp_df" in st.session_state:
     st.subheader("Таблица-редактор")
 
     show_reasons = st.checkbox("Показать пояснения к типам", value=False)
-    table_df = apply_display_mode(df, display_mode)
+    table_df = apply_display_mode(df)
     if not show_reasons:
         table_df = table_df.drop(columns=reason_cols, errors="ignore")
 
@@ -916,6 +963,7 @@ if "comp_df" in st.session_state:
     disabled_cols = [col for col in table_df.columns if col not in type_cols]
 
     st.caption("Типы заполняются автоматически для всех строк: графические, фонетические, морфологические, синтаксические, лексические, пропуск, идентично.")
+    st.caption("Редкие исторические знаки в таблице автоматически показаны в совместимом виде, чтобы не появлялись квадраты. Экспорт сохраняет оригинальные символы.")
     st.caption(f"Показано строк: {len(table_df)}")
     edited_visible = st.data_editor(
         table_df,
@@ -954,14 +1002,14 @@ if "comp_df" in st.session_state:
         word_index = selected_row_idx
         selected_surface = st.session_state.base_words[selected_row_idx]["surface"]
         source_name = main_file
-        render_context(words_list, word_index, selected_surface, source_name, display_mode)
+        render_context(words_list, word_index, selected_surface, source_name)
     else:
         other_name = context_source.replace("Слово (", "", 1).rstrip(")")
         aligned_word = st.session_state.all_aligns.get(other_name, {}).get(selected_row_idx)
         if aligned_word:
             words_list = st.session_state.raw_data[other_name]
             word_index = aligned_word["idx"]
-            render_context(words_list, word_index, aligned_word["surface"], other_name, display_mode)
+            render_context(words_list, word_index, aligned_word["surface"], other_name)
         else:
             st.info("В выбранном списке для этой строки стоит пропуск.")
 
